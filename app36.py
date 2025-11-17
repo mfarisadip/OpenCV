@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import time
 import os
+import onnxruntime as ort
 
 # Configuration
 MODEL_PATH = 'runs/detect/train3/weights/best.onnx'
@@ -76,14 +77,23 @@ else:
 
 line_y_position = int(video_info['height'] * 0.55)  # 55% from top
 
-# Load YOLO model
+# Load ONNX model
 try:
-    from ultralytics import YOLO
-    model = YOLO(MODEL_PATH)
-    print("YOLO model loaded successfully")
+    # Set providers for ONNX Runtime
+    providers = ['CUDAExecutionProvider'] if USE_CUDA else ['CPUExecutionProvider']
+    session = ort.InferenceSession(MODEL_PATH, providers=providers)
+    print("ONNX model loaded successfully on {}".format(DEVICE))
 except Exception as e:
-    print("Error loading YOLO model: {}".format(e))
+    print("Error loading ONNX model: {}".format(e))
     exit()
+
+# Get input and output info
+input_name = session.get_inputs()[0].name
+input_shape = session.get_inputs()[0].shape
+output_names = [output.name for output in session.get_outputs()]
+
+# Class names (replace with your actual class names)
+CLASS_NAMES = ['crack', 'pothole']  # Adjust according to your model
 
 # Detection tracking variables
 pothole_count = 0
@@ -187,17 +197,54 @@ def get_timestamp(frame_index, fps):
     seconds = int(seconds % 60)
     return "{:02d}:{:02d}".format(minutes, seconds)
 
-def filter_detections(detections):
-    """Filter detections to only include crack and pothole classes"""
-    filtered_indices = []
-    for i, class_id in enumerate(detections):
-        class_name = model.names[class_id].lower()
-        if class_name in ['crack', 'pothole']:
-            filtered_indices.append(i)
+def preprocess_image(image, input_shape):
+    """Preprocess image for ONNX model input"""
+    # Resize image to match input shape
+    resized = cv2.resize(image, (input_shape[3], input_shape[2]))
+    
+    # Normalize image
+    resized = resized.astype(np.float32) / 255.0
+    
+    # Add batch dimension
+    resized = np.expand_dims(resized, axis=0)
+    
+    # Change HWC to CHW
+    resized = np.transpose(resized, (0, 3, 1, 2))
+    
+    return resized
 
-    return filtered_indices
+def postprocess_output(output, image_shape, conf_threshold=0.4):
+    """Postprocess ONNX model output"""
+    # Get output dimensions
+    boxes = output[0][:, :4]
+    scores = output[0][:, 4]
+    class_ids = output[0][:, 5].astype(int)
+    
+    # Filter by confidence
+    mask = scores > conf_threshold
+    boxes = boxes[mask]
+    scores = scores[mask]
+    class_ids = class_ids[mask]
+    
+    # Scale boxes to original image size
+    input_height, input_width = image_shape[0], image_shape[1]
+    output_height, output_width = image_shape[2], image_shape[3]
+    
+    x_scale = input_width / output_width
+    y_scale = input_height / output_height
+    
+    scaled_boxes = []
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        x1 = int(x1 * x_scale)
+        y1 = int(y1 * y_scale)
+        x2 = int(x2 * x_scale)
+        y2 = int(y2 * y_scale)
+        scaled_boxes.append([x1, y1, x2, y2])
+    
+    return scaled_boxes, scores, class_ids
 
-def draw_detections(image, detections, tracker_ids=None, confidences=None):
+def draw_detections(image, detections, tracker_ids=None, confidences=None, class_ids=None):
     """Draw bounding boxes and labels on image"""
     for i in range(len(detections)):
         x1, y1, x2, y2 = detections[i]
@@ -206,11 +253,14 @@ def draw_detections(image, detections, tracker_ids=None, confidences=None):
         cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
         
         # Create label
+        label = ""
+        if class_ids is not None and i < len(class_ids):
+            class_name = CLASS_NAMES[class_ids[i]]
+            label = class_name
+        
         if tracker_ids is not None and i < len(tracker_ids):
             tracker_id = tracker_ids[i]
-            label = "ID: {}".format(tracker_id)
-        else:
-            label = "Detection"
+            label = "ID: {} {}".format(tracker_id, label)
             
         if confidences is not None and i < len(confidences):
             label += " {:.2f}".format(confidences[i])
@@ -227,28 +277,22 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
 
     start_time = time.time()
 
-    # Model prediction on single frame
-    results = model(frame, conf=0.4, iou=0.3, verbose=False)
+    # Preprocess image
+    input_tensor = preprocess_image(frame, input_shape)
     
-    # Extract detections
-    detections = []
-    confidences = []
-    class_ids = []
+    # Run inference
+    outputs = session.run(output_names, {input_name: input_tensor})
     
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = box.conf[0].cpu().numpy()
-                cls = box.cls[0].cpu().numpy()
-                
-                detections.append([x1, y1, x2, y2])
-                confidences.append(conf)
-                class_ids.append(int(cls))
+    # Postprocess output
+    detections, confidences, class_ids = postprocess_output(outputs, input_shape)
     
     # Filter for crack and pothole only
-    filtered_indices = filter_detections(class_ids)
+    filtered_indices = []
+    for i, class_id in enumerate(class_ids):
+        if class_id < len(CLASS_NAMES):
+            class_name = CLASS_NAMES[class_id]
+            if class_name in ['crack', 'pothole']:
+                filtered_indices.append(i)
     
     if filtered_indices:
         filtered_detections = [detections[i] for i in filtered_indices]
@@ -290,7 +334,8 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
             annotated_frame, 
             filtered_detections, 
             tracker_ids, 
-            filtered_confidences
+            filtered_confidences,
+            filtered_class_ids
         )
     
     # Check for objects below the line
@@ -303,7 +348,7 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
             
             if center_y >= line_y_position:  # Object is below the line
                 class_id = filtered_class_ids[i]
-                class_name = model.names[class_id].lower()
+                class_name = CLASS_NAMES[class_id]
                 confidence = filtered_confidences[i]
                 
                 if class_name == 'pothole':
