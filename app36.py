@@ -13,7 +13,7 @@ MODEL_PATH = 'best_ir8.onnx'
 parser = argparse.ArgumentParser(description='Crack and Pothole Detection with Camera Input')
 parser.add_argument('--source', type=str, default='camera',
                     help='Source: "camera" for live camera, "video" for video file')
-parser.add_argument('--video-path', type=str, default='waki.mp4',
+parser.add_argument('--video-path', type=str, default='pole.mp4',
                     help='Path to video file when source is "video"')
 parser.add_argument('--camera-id', type=int, default=0,
                     help='Camera ID (default: 0)')
@@ -218,24 +218,31 @@ def postprocess_output(output, image_shape, conf_threshold=0.4):
     # Convert output to numpy array
     output0 = np.asarray(output[0])
 
-    # If output is 1D, reshape to 2D with 6 columns (YOLO format)
-    if output0.ndim == 1:
-        # Check if the array length is divisible by 6
-        if len(output0) % 6 == 0:
-            output0 = output0.reshape(-1, 6)
+    # Handle the actual output format: (1, 6, 1029) -> [batch, features, detections]
+    if output0.ndim == 3 and output0.shape[1] == 6:
+        # Transpose to get [detections, features] format
+        output0 = output0.transpose(0, 2, 1)[0]  # Shape: (1029, 6)
+
+        # Extract boxes, scores, and class IDs
+        boxes = output0[:, :4]  # (1029, 4)
+        scores = output0[:, 4]  # (1029,)
+        class_ids = output0[:, 5].astype(int)  # (1029,)
+
+    elif output0.ndim == 2:
+        # Standard 2D output format
+        if output0.shape[1] >= 6:
+            # YOLO format: [x1, y1, x2, y2, confidence, class_id, ...]
+            boxes = output0[:, :4]
+            scores = output0[:, 4]
+            class_ids = output0[:, 5].astype(int)
         else:
-            # If not divisible by 6, there might be a different format
-            # Return empty results for this frame
+            # Unexpected format
+            print(f"Unexpected 2D output shape: {output0.shape}")
             return [], [], []
-
-    # Check if we have valid detections
-    if output0.size == 0 or len(output0) == 0:
+    else:
+        # Unexpected format
+        print(f"Unexpected output format: {output0.shape}")
         return [], [], []
-
-    # Extract boxes, scores, and class IDs
-    boxes = output0[:, :4]
-    scores = output0[:, 4]
-    class_ids = output0[:, 5].astype(int)
 
     # Filter by confidence
     mask = scores > conf_threshold
