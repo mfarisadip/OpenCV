@@ -1,0 +1,76 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Virtual Environment
+venv/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp_frame.jpg
+
+# Claude
+.claude/
+
+# Model artifacts (too large for Docker context)
+# Keep only essential model files, exclude training artifacts
+runs/detect/train/
+runs/detect/train2/
+runs/detect/val/
+runs/detect/val2/
+runs/detect/train*/weights/last.pt
+runs/detect/train*/weights/epoch*.pt
+
+# Video files (mount these as volumes instead)
+*.mp4
+*.avi
+*.mov
+*.mkv
+wa.mp4
+pole.mp4
+waki.mp4
+output_annotated_video*.mp4
+
+# Documentation
+*.md
+!CLAUDE.md
+!README_Docker.md
+
+# Reports (keep detection reports)
+# *.txt
+!detection_report_*.txt
+
+# Cache
+.cache/
+.pytest_cache/

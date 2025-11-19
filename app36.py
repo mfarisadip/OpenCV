@@ -7,7 +7,7 @@ import os
 import onnxruntime as ort
 
 # Configuration
-MODEL_PATH = 'best_ir8.onnx'
+MODEL_PATH = 'best_ir8.onnx'  # Path to the optimized ONNX model
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Crack and Pothole Detection with Camera Input')
@@ -25,9 +25,9 @@ parser.add_argument('--device', type=str, default='cpu',
                     help='Device to use: "cpu" or "cuda"')
 args = parser.parse_args()
 
-# Set device based on arguments
-USE_CUDA = args.device.lower() == 'cuda'
-DEVICE = 'cuda' if USE_CUDA else 'cpu'
+# Force CPU for Python 3.6 compatibility
+USE_CUDA = False
+DEVICE = 'cpu'
 
 # Set source based on arguments
 USE_CAMERA = args.source == 'camera'
@@ -80,9 +80,9 @@ line_y_position = int(video_info['height'] * 0.55)  # 55% from top
 # Load ONNX model
 try:
     # Set providers for ONNX Runtime
-    providers = ['CUDAExecutionProvider'] if USE_CUDA else ['CPUExecutionProvider']
+    providers = ['CPUExecutionProvider']  # Force CPU for Python 3.6 compatibility
     session = ort.InferenceSession(MODEL_PATH, providers=providers)
-    print("ONNX model loaded successfully on {}".format(DEVICE))
+    print("ONNX model loaded successfully on CPU")
 except Exception as e:
     print("Error loading ONNX model: {}".format(e))
     exit()
@@ -92,9 +92,11 @@ input_name = session.get_inputs()[0].name
 input_shape = session.get_inputs()[0].shape
 output_names = [output.name for output in session.get_outputs()]
 
+print(f"Model input shape: {input_shape}")
+print(f"Model output shape will be processed")
 
-# Class names (replace with your actual class names)
-CLASS_NAMES = ['crack', 'pothole']  # Adjust according to your model
+# Class names
+CLASS_NAMES = ['crack', 'pothole']
 
 # Detection tracking variables
 pothole_count = 0
@@ -198,88 +200,253 @@ def get_timestamp(frame_index, fps):
     seconds = int(seconds % 60)
     return "{:02d}:{:02d}".format(minutes, seconds)
 
-def preprocess_image(image, input_shape):
-    """Preprocess image for ONNX model input"""
-    # Resize image to match input shape
-    resized = cv2.resize(image, (input_shape[3], input_shape[2]))
-    
-    # Normalize image
-    resized = resized.astype(np.float32) / 255.0
-    
-    # Add batch dimension
-    resized = np.expand_dims(resized, axis=0)
-    
-    # Change HWC to CHW
-    resized = np.transpose(resized, (0, 3, 1, 2))
-    
-    return resized
+def preprocess_image_yolo(image, input_size=640):
+    """Preprocess image for YOLO model with letterboxing (maintain aspect ratio)"""
+    # Get original dimensions
+    h, w = image.shape[:2]
 
-def postprocess_output(output, image_shape, conf_threshold=0.05):  # Adjusted threshold
-    """Postprocess ONNX model output for YOLOv8 format"""
-    # Convert output to numpy array
-    output0 = np.asarray(output[0])
+    # Calculate new dimensions maintaining aspect ratio
+    scale = min(input_size / w, input_size / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
 
-    # Handle ONNX model output format: (1, 6, 1029) -> [batch, features, detections]
-    # Dimensi 0: batch (biasanya 1)
-    # Dimensi 1: features (6 = x1, y1, x2, y2, confidence, class_id)
-    # Dimensi 2: detections (jumlah deteksi, 1029)
+    # Resize image
+    resized = cv2.resize(image, (new_w, new_h))
 
-    if output0.ndim == 3 and output0.shape[1] == 6:
-        # Format: (1, 6, 1029) -> [batch, features, detections]
-        # Transpose menjadi (1, 1029, 6) -> [batch, detections, features]
-        output0 = output0.transpose(0, 2, 1)  # Shape: (1, 1029, 6)
-        output0 = output0[0]  # Ambil batch pertama: (1029, 6)
+    # Create letterbox (black padding)
+    letterbox = np.full((input_size, input_size, 3), 114, dtype=np.uint8)  # Gray padding
+    y_offset = (input_size - new_h) // 2
+    x_offset = (input_size - new_w) // 2
 
-        # Filter detections dengan confidence > 0
-        # Format YOLO: [x1, y1, x2, y2, confidence, class_id]
-        conf_mask = output0[:, 4] > conf_threshold  # Filter berdasarkan confidence
-        valid_detections = output0[conf_mask]  # Shape: (n_valid_detections, 6)
+    # Place resized image on letterbox
+    letterbox[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
 
-        if len(valid_detections) == 0:
+    # Convert BGR to RGB
+    letterbox = cv2.cvtColor(letterbox, cv2.COLOR_BGR2RGB)
+
+    # Normalize to [0, 1]
+    letterbox = letterbox.astype(np.float32) / 255.0
+
+    # Add batch dimension: HWC -> BCHW
+    input_tensor = np.transpose(letterbox, (2, 0, 1))  # CHW
+    input_tensor = np.expand_dims(input_tensor, axis=0)  # BCHW
+
+    return input_tensor, scale, x_offset, y_offset
+
+def apply_nms(boxes, scores, iou_threshold=0.5):
+    """Apply Non-Maximum Suppression to remove duplicate detections"""
+    if len(boxes) == 0:
+        return []
+
+    # Convert boxes to [x1, y1, x2, y2] format if needed
+    boxes = boxes.astype(float)
+
+    # Calculate areas
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+    # Sort by confidence score
+    indices = np.argsort(scores)[::-1]
+
+    keep = []
+    while len(indices) > 0:
+        # Pick the box with highest confidence
+        current = indices[0]
+        keep.append(current)
+
+        if len(indices) == 1:
+            break
+
+        # Calculate IoU with remaining boxes
+        remaining_indices = indices[1:]
+        current_box = boxes[current]
+        remaining_boxes = boxes[remaining_indices]
+
+        # Calculate intersection
+        x1 = np.maximum(current_box[0], remaining_boxes[:, 0])
+        y1 = np.maximum(current_box[1], remaining_boxes[:, 1])
+        x2 = np.minimum(current_box[2], remaining_boxes[:, 2])
+        y2 = np.minimum(current_box[3], remaining_boxes[:, 3])
+
+        intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+
+        # Calculate union
+        union = areas[current] + areas[remaining_indices] - intersection
+
+        # Calculate IoU
+        iou = intersection / (union + 1e-6)
+
+        # Keep boxes with IoU less than threshold
+        indices = remaining_indices[iou < iou_threshold]
+
+    return keep
+
+def run_yolo_onnx_inference(frame, conf_threshold=0.002, input_size=640):  # Standard YOLO input size
+    """Run YOLO ONNX inference manually"""
+    try:
+        # Preprocess image
+        input_tensor, scale, x_offset, y_offset = preprocess_image_yolo(frame, input_size)
+
+        # Run inference
+        outputs = session.run(output_names, {input_name: input_tensor})
+
+        # Process output (YOLO format)
+        output = outputs[0]  # Model output
+
+        # Handle different output formats
+        if len(output.shape) == 3:
+            if output.shape[1] == 6:  # Format: [1, 6, detections]
+                output = output.transpose(0, 2, 1)[0]  # [detections, 6]
+            else:
+                output = output[0]  # Remove batch dimension
+
+        # If output is in [features, detections] format, transpose it
+        if output.shape[0] == 6 and output.shape[1] > 6:  # [6, detections]
+            output = output.T  # [detections, 6]
+
+        # Filter detections - try different interpretations
+        detections = []
+        for detection in output:
+            if len(detection) >= 6:
+                # Try different interpretations of the output format
+                # Option 1: Normalized coordinates [0,1]
+                x1, y1, x2, y2 = detection[:4]
+                score1 = detection[4]  # Could be confidence or class score
+                score2 = detection[5]  # Could be class score or confidence
+
+                # Check if coordinates are normalized (0-1 range) or absolute pixels
+                coord_max = max(abs(x1), abs(y1), abs(x2), abs(y2))
+
+                # Try different confidence calculations
+                confidence1 = abs(float(score1))  # Use absolute value
+                confidence2 = abs(float(score2))
+                confidence3 = abs(float(score1 * score2))  # Combined
+
+                # Use the best confidence
+                confidence = max(confidence1, confidence2, confidence3)
+
+                if confidence > conf_threshold:
+                    # Simple class determination
+                    class_id = 0 if abs(score1) > abs(score2) else 1  # 0=crack, 1=pothole
+
+                    # Scale coordinates back to original frame size
+                    h, w = frame.shape[:2]
+                    if coord_max <= 1.0:  # Normalized coordinates
+                        # Scale to input size first
+                        x1 = int(x1 * input_size)
+                        y1 = int(y1 * input_size)
+                        x2 = int(x2 * input_size)
+                        y2 = int(y2 * input_size)
+                    else:  # Already in pixel coordinates (input size)
+                        x1 = int(x1)
+                        y1 = int(y1)
+                        x2 = int(x2)
+                        y2 = int(y2)
+
+                    # Adjust for letterbox padding (remove offset and scale back to original)
+                    x1 = int((x1 - x_offset) / scale)
+                    y1 = int((y1 - y_offset) / scale)
+                    x2 = int((x2 - x_offset) / scale)
+                    y2 = int((y2 - y_offset) / scale)
+
+                    # Clamp to image boundaries
+                    x1 = max(0, min(x1, w))
+                    y1 = max(0, min(y1, h))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+
+                    # Ensure valid box
+                    if x2 > x1 and y2 > y1:
+                        detections.append([x1, y1, x2, y2, confidence, class_id])
+
+        if not detections:
             return [], [], []
 
-        # Extract boxes, scores, dan class IDs
-        boxes = valid_detections[:, :4]  # (n_valid_detections, 4)
-        scores = valid_detections[:, 4]  # (n_valid_detections,)
-        class_ids = valid_detections[:, 5].astype(int)  # (n_valid_detections,)
+        detections = np.array(detections)
+        boxes = detections[:, :4].astype(int)
+        scores = detections[:, 4]
+        class_ids = detections[:, 5].astype(int)
 
-    elif output0.ndim == 2:
-        # Standard 2D output format (fallback)
-        if output0.shape[1] >= 6:
-            # YOLO format: [x1, y1, x2, y2, confidence, class_id, ...]
-            conf_mask = output0[:, 4] > conf_threshold
-            valid_detections = output0[conf_mask]
+        # Apply Non-Maximum Suppression to reduce duplicate detections
+        filtered_indices = apply_nms(boxes, scores, iou_threshold=0.3)  # More aggressive
 
-            if len(valid_detections) == 0:
-                return [], [], []
-
-            boxes = valid_detections[:, :4]
-            scores = valid_detections[:, 4]
-            class_ids = valid_detections[:, 5].astype(int)
-        else:
-            print(f"Unexpected 2D output shape: {output0.shape}")
+        if len(filtered_indices) == 0:
             return [], [], []
-    else:
-        print(f"Unexpected output format: {output0.shape}")
+
+        boxes = boxes[filtered_indices]
+        scores = scores[filtered_indices]
+        class_ids = class_ids[filtered_indices]
+
+        # Filter by bounding box size and position (remove sky detections)
+        h, w = frame.shape[:2]
+        valid_indices = []
+
+        # Define sky region (top 30% of frame)
+        sky_threshold = int(h * 0.3)  # Only process detections below 30% from top
+
+        for i, (box, score) in enumerate(zip(boxes, scores)):
+            x1, y1, x2, y2 = box
+            box_width = x2 - x1
+            box_height = y2 - y1
+            box_area = box_width * box_height
+
+            # Minimum size: 10x10 pixels, Maximum size: 80% of frame
+            min_area = 10 * 10
+            max_area = int(w * h * 0.8)
+
+            # Also check aspect ratio (potholes and cracks are usually not extremely wide or tall)
+            aspect_ratio = box_width / max(box_height, 1)
+
+            # Filter out detections in sky region (top 30% of frame)
+            # Potholes and cracks should be on the ground, not in the sky
+            center_y = (y1 + y2) // 2
+
+            # More strict confidence filtering
+            min_confidence = 0.005  # Higher minimum confidence
+
+            if (min_area <= box_area <= max_area and
+                0.1 <= aspect_ratio <= 10 and  # Reasonable aspect ratio
+                center_y > sky_threshold and  # Must be below sky threshold
+                score > min_confidence):  # Minimum confidence threshold
+                valid_indices.append(i)
+
+        if len(valid_indices) == 0:
+            return [], [], []
+
+        # Additional filtering for potholes (should be more compact)
+        final_indices = []
+        for i in valid_indices:
+            class_id = class_ids[i]
+            box = boxes[i]
+            score = scores[i]
+
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+
+            # For potholes: expect more square-ish shape (width/height ratio close to 1)
+            if class_id == 1:  # pothole
+                aspect_ratio = width / max(height, 1)
+                if 0.5 <= aspect_ratio <= 2.0:  # Potholes should be reasonably square
+                    # Also check if it's not too large (potholes are usually smaller)
+                    area = width * height
+                    max_pothole_area = int(w * h * 0.05)  # Max 5% of frame
+                    if area <= max_pothole_area:
+                        final_indices.append(i)
+            else:  # crack - can be elongated
+                final_indices.append(i)
+
+        if len(final_indices) == 0:
+            return [], [], []
+
+        boxes = boxes[final_indices]
+        scores = scores[final_indices]
+        class_ids = class_ids[final_indices]
+
+        return boxes, scores, class_ids
+
+    except Exception as e:
+        print("Error in YOLO ONNX inference: {}".format(e))
         return [], [], []
-    
-    # Scale boxes to original image size
-    input_height, input_width = image_shape[0], image_shape[1]
-    output_height, output_width = image_shape[2], image_shape[3]
-    
-    x_scale = input_width / output_width
-    y_scale = input_height / output_height
-    
-    scaled_boxes = []
-    for box in boxes:
-        x1, y1, x2, y2 = box
-        x1 = int(x1 * x_scale)
-        y1 = int(y1 * y_scale)
-        x2 = int(x2 * x_scale)
-        y2 = int(y2 * y_scale)
-        scaled_boxes.append([x1, y1, x2, y2])
-    
-    return scaled_boxes, scores, class_ids
 
 def draw_detections(image, detections, tracker_ids=None, confidences=None, class_ids=None):
     """Draw bounding boxes and labels on image"""
@@ -314,31 +481,13 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
 
     start_time = time.time()
 
-    # Preprocess image
-    input_tensor = preprocess_image(frame, input_shape)
-    
-    # Run inference
-    outputs = session.run(output_names, {input_name: input_tensor})
-    
-    # Postprocess output
-    detections, confidences, class_ids = postprocess_output(outputs, input_shape)
-    
-    # Filter for crack and pothole only
-    filtered_indices = []
-    for i, class_id in enumerate(class_ids):
-        if class_id < len(CLASS_NAMES):
-            class_name = CLASS_NAMES[class_id]
-            if class_name in ['crack', 'pothole']:
-                filtered_indices.append(i)
-    
-    if filtered_indices:
-        filtered_detections = [detections[i] for i in filtered_indices]
-        filtered_confidences = [confidences[i] for i in filtered_indices]
-        filtered_class_ids = [class_ids[i] for i in filtered_indices]
-    else:
-        filtered_detections = []
-        filtered_confidences = []
-        filtered_class_ids = []
+    # Run YOLO ONNX inference
+    detections, confidences, class_ids = run_yolo_onnx_inference(frame)
+
+    # Detections are already filtered by YOLO model
+    filtered_detections = detections
+    filtered_confidences = confidences
+    filtered_class_ids = class_ids
     
     # Update tracker with filtered detections
     tracked_objects = centroid_tracker.update(filtered_detections)
@@ -371,7 +520,7 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
     
     # Draw detections
     annotated_frame = frame.copy()
-    if filtered_detections:
+    if len(filtered_detections) > 0:
         annotated_frame = draw_detections(
             annotated_frame, 
             filtered_detections, 
@@ -608,16 +757,16 @@ if __name__ == "__main__":
             print("\n🕳️  Potholes ({}):".format(len(pothole_logs)))
             for i, log in enumerate(pothole_logs, 1):
                 detection_type = log.get('detection_type', 'unknown')
-                print("   {}. Tracker ID #{0} at {1} (Frame {2}, Y: {3}, Conf: {4:.2f}) [{5}]".format(
-                    i, log['tracker_id'], log['timestamp'], log['frame'], 
+                print("   {}. Tracker ID #{} at {} (Frame {}, Y: {}, Conf: {:.2f}) [{}]".format(
+                    i, log['tracker_id'], log['timestamp'], log['frame'],
                     log['position'], log['confidence'], detection_type.replace('_', ' ').title()))
 
         if crack_logs:
             print("\n〰️  Cracks ({}):".format(len(crack_logs)))
             for i, log in enumerate(crack_logs, 1):
                 detection_type = log.get('detection_type', 'unknown')
-                print("   {}. Tracker ID #{0} at {1} (Frame {2}, Y: {3}, Conf: {4:.2f}) [{5}]".format(
-                    i, log['tracker_id'], log['timestamp'], log['frame'], 
+                print("   {}. Tracker ID #{} at {} (Frame {}, Y: {}, Conf: {:.2f}) [{}]".format(
+                    i, log['tracker_id'], log['timestamp'], log['frame'],
                     log['position'], log['confidence'], detection_type.replace('_', ' ').title()))
 
     print("="*60)
