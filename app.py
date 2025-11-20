@@ -5,9 +5,24 @@ from datetime import datetime
 import time
 import cv2
 import argparse
+import torch
 
 # Configuration
 MODEL_PATH = 'weights/YOLOV8n640IR8.onnx'
+
+# Check CUDA availability
+def check_cuda_availability():
+    """Check if CUDA is available and get device information"""
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        current_device = torch.cuda.current_device()
+        device_name = torch.cuda.get_device_name(current_device)
+        return True, device_count, current_device, device_name
+    else:
+        return False, 0, None, None
+
+# Global CUDA variables
+CUDA_AVAILABLE, CUDA_DEVICE_COUNT, CUDA_CURRENT_DEVICE, CUDA_DEVICE_NAME = check_cuda_availability()
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Crack and Pothole Detection with Camera Input')
@@ -21,7 +36,34 @@ parser.add_argument('--output', type=str, default='output_annotated_video_optimi
                     help='Output video file path')
 parser.add_argument('--save-video', action='store_true',
                     help='Save processed video to file')
+parser.add_argument('--device', type=str, default='auto',
+                    help='Device to use: "cuda", "cpu", or "auto" (default: auto)')
+parser.add_argument('--cuda-device', type=int, default=0,
+                    help='CUDA device ID when using CUDA (default: 0)')
 args = parser.parse_args()
+
+# Determine device to use
+def determine_device():
+    """Determine which device to use based on arguments and availability"""
+    if args.device.lower() == 'cuda':
+        if CUDA_AVAILABLE:
+            return f'cuda:{args.cuda_device}'
+        else:
+            print("⚠️ CUDA requested but not available. Falling back to CPU.")
+            return 'cpu'
+    elif args.device.lower() == 'cpu':
+        return 'cpu'
+    elif args.device.lower() == 'auto':
+        if CUDA_AVAILABLE:
+            return f'cuda:{args.cuda_device}'
+        else:
+            print("ℹ️ CUDA not available. Using CPU.")
+            return 'cpu'
+    else:
+        print(f"⚠️ Unknown device '{args.device}'. Using auto detection.")
+        return 'cuda' if CUDA_AVAILABLE else 'cpu'
+
+DEVICE = determine_device()
 
 # Set source based on arguments
 USE_CAMERA = args.source == 'camera'
@@ -55,7 +97,17 @@ LINE_START = sv.Point(0, line_y_position)
 LINE_END = sv.Point(video_info.width, line_y_position)
 
 # Load YOLO model
+print(f"🔄 Loading YOLO model from {MODEL_PATH}...")
+print(f"🖥️  Using device: {DEVICE}")
+if DEVICE.startswith('cuda'):
+    print(f"🎮 CUDA Device: {CUDA_DEVICE_NAME} (ID: {args.cuda_device})")
+    print(f"📊 Available CUDA devices: {CUDA_DEVICE_COUNT}")
+
 model = YOLO(MODEL_PATH)
+
+# Move model to the specified device
+model.to(DEVICE)
+print(f"✅ Model loaded successfully on {DEVICE}")
 
 # create BYTETracker instance for better object tracking
 byte_tracker = sv.ByteTrack()
@@ -203,6 +255,12 @@ def process_frame(frame: np.ndarray, frame_index: int = None) -> np.ndarray:
     cv2.putText(annotated_frame, f'Process: {processing_time:.3f}s', (10, 145),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
+    # Device info
+    device_text = f'Device: {DEVICE.upper()}'
+    device_color = (0, 255, 0) if DEVICE.startswith('cuda') else (0, 165, 255)  # Green for CUDA, Orange for CPU
+    cv2.putText(annotated_frame, device_text, (10, 170),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, device_color, 2)
+
     # Draw detection line
     annotated_frame = cv2.line(annotated_frame,
                              (LINE_START.x, LINE_START.y),
@@ -220,6 +278,9 @@ def process_camera_feed():
 
     print(f"Processing camera feed from Camera {CAMERA_ID}")
     print(f"Model: {MODEL_PATH}")
+    print(f"Device: {DEVICE.upper()}")
+    if DEVICE.startswith('cuda'):
+        print(f"CUDA Device: {CUDA_DEVICE_NAME} (ID: {args.cuda_device})")
     print(f"Line position: Y={line_y_position} (55% from top)")
     print(f"Resolution: {video_info.width}x{video_info.height}")
     print(f"FPS: {video_info.fps}")
@@ -291,6 +352,9 @@ if __name__ == "__main__":
         # Process video file (original functionality)
         print(f"Processing video: {SOURCE_VIDEO_PATH}")
         print(f"Model: {MODEL_PATH}")
+        print(f"Device: {DEVICE.upper()}")
+        if DEVICE.startswith('cuda'):
+            print(f"CUDA Device: {CUDA_DEVICE_NAME} (ID: {args.cuda_device})")
         print(f"Line position: Y={line_y_position} (55% from top)")
         print(f"Output: {TARGET_VIDEO_PATH}")
         print(f"Total frames: {video_info.total_frames}")
@@ -316,6 +380,9 @@ if __name__ == "__main__":
     print("🔍 FINAL DETECTION SUMMARY")
     print("="*60)
     print(f"📹 Source: {source_text}")
+    print(f"🖥️  Device: {DEVICE.upper()}")
+    if DEVICE.startswith('cuda'):
+        print(f"🎮 CUDA Device: {CUDA_DEVICE_NAME} (ID: {args.cuda_device})")
     print(f"🕳️  Total Potholes Detected: {pothole_count}")
     print(f"〰️  Total Cracks Detected: {crack_count}")
     print(f"📊 Total Detections: {pothole_count + crack_count}")
@@ -349,10 +416,13 @@ if __name__ == "__main__":
     print("="*60)
 
     # Save detection report to file
+    cuda_device_info = f"CUDA Device: {CUDA_DEVICE_NAME} (ID: {args.cuda_device})" if DEVICE.startswith('cuda') else "Device: CPU"
+
     report_content = f"""
 OPTIMIZED CRACK AND POTHOLE DETECTION REPORT
 Source: {source_text}
 Model: {MODEL_PATH}
+{cuda_device_info}
 Processing Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Line Position: Y={line_y_position} (55% from top)
 
@@ -362,6 +432,7 @@ SUMMARY:
 - Total Detections: {pothole_count + crack_count}
 - Processing Time: {processing_duration:.2f} seconds
 - Processing Speed: {total_frames/processing_duration:.2f} FPS
+- Hardware Acceleration: {DEVICE.upper()}
 
 DETAILED LOG:
 """
